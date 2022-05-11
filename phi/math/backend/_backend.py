@@ -1030,6 +1030,12 @@ class Backend:
             return self.conjugate_gradient(lin, y, x0, rtol, atol, max_iter, trj)
         elif method == 'CG-adaptive':
             return self.conjugate_gradient_adaptive(lin, y, x0, rtol, atol, max_iter, trj)
+        elif method in ('biCG', 'biCGstab(0)'):
+            return self.bi_conjugate_gradient(0, lin, y, x0, rtol, atol, max_iter, trj)
+        elif method in ('biCGstab', 'biCGstab(1)'):
+            return self.bi_conjugate_gradient(1, lin, y, x0, rtol, atol, max_iter, trj)
+        elif method == 'biCGstab(2)':
+            return self.bi_conjugate_gradient(2, lin, y, x0, rtol, atol, max_iter, trj)
         else:
             raise NotImplementedError(f"Method '{method}' not supported for linear solve.")
 
@@ -1126,6 +1132,49 @@ class Backend:
             return continue_, it_counter, x, dx, dy, residual, iterations, function_evaluations, converged, diverged
 
         _, _, x, _, _, residual, iterations, function_evaluations, converged, diverged = self.while_loop(acg_loop_body, (continue_, 0, x, dx, dy, residual, iterations, function_evaluations, converged, diverged))
+        return trajectory if trj else SolveResult(method, x, residual, iterations, function_evaluations, converged, diverged, "")
+
+    def bi_conjugate_gradient(self, order, lin, y, x0, rtol, atol, max_iter, trj: bool) -> SolveResult or List[SolveResult]:
+        method = f"Φ-Flow biCG({order}) ({self.name})"
+        y = self.to_float(y)
+        x0 = self.copy(self.to_float(x0), only_mutable=True)
+        batch_size = self.staticshape(y)[0]
+        tolerance_sq = self.maximum(rtol ** 2 * self.sum(y ** 2, -1), atol ** 2)
+        x = x0
+        dx = residual = y - self.linear(lin, x)
+        dy = self.linear(lin, dx)
+        iterations = self.zeros([batch_size], DType(int, 32))
+        function_evaluations = self.ones([batch_size], DType(int, 32))
+        residual_squared = rsq0 = self.sum(residual ** 2, -1, keepdims=True)
+        diverged = self.any(~self.isfinite(x), axis=(1,))
+        converged = self.all(residual_squared <= tolerance_sq, axis=(1,))
+        trajectory = [SolveResult(method, x, residual, iterations, function_evaluations, converged, diverged, "")] if trj else None
+        continue_ = ~converged & ~diverged & (iterations < max_iter)
+        raise NotImplementedError
+
+        def bi_cg_loop_body(continue_, it_counter, x, dx, dy, residual, iterations, function_evaluations, _converged, _diverged):
+            continue_1 = self.to_int32(continue_)
+            it_counter += 1
+            iterations += continue_1
+            dx_dy = self.sum(dx * dy, axis=-1, keepdims=True)
+            step_size = self.divide_no_nan(self.sum(dx * residual, axis=-1, keepdims=True), dx_dy)
+            step_size *= self.expand_dims(self.to_float(continue_1), -1)  # this is not really necessary but ensures batch-independence
+            x += step_size * dx
+            residual = residual - step_size * dy  # in-place subtraction affects convergence
+            residual_squared = self.sum(residual ** 2, -1, keepdims=True)
+            dx = residual - self.divide_no_nan(self.sum(residual * dy, axis=-1, keepdims=True) * dx, dx_dy)
+            with spatial_derivative_evaluation(1):
+                dy = self.linear(lin, dx); function_evaluations += continue_1
+            diverged = self.any(residual_squared / rsq0 > 100, axis=(1,)) & (iterations >= 8)
+            converged = self.all(residual_squared <= tolerance_sq, axis=(1,))
+            if trajectory is not None:
+                trajectory.append(SolveResult(method, x, residual, iterations, function_evaluations, converged, diverged, ""))
+                x = self.copy(x)
+                iterations = self.copy(iterations)
+            continue_ = ~converged & ~diverged & (iterations < max_iter)
+            return continue_, it_counter, x, dx, dy, residual, iterations, function_evaluations, converged, diverged
+
+        _, _, x, _, _, residual, iterations, function_evaluations, converged, diverged = self.while_loop(bi_cg_loop_body, (continue_, 0, x, dx, dy, residual, iterations, function_evaluations, converged, diverged))
         return trajectory if trj else SolveResult(method, x, residual, iterations, function_evaluations, converged, diverged, "")
 
     def linear(self, lin, vector):

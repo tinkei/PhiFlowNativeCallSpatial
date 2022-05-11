@@ -1,4 +1,5 @@
 import numbers
+import os.path
 import warnings
 from contextlib import contextmanager
 from functools import wraps
@@ -365,6 +366,8 @@ class TorchBackend(Backend):
         if isinstance(A, torch.Tensor) and A.is_sparse:
             result = torch.sparse.mm(A, torch.transpose(b, 0, 1))
             return torch.transpose(result, 0, 1)
+        elif isinstance(A, SparseCSRMatrix):
+            raise NotImplementedError
         raise NotImplementedError(type(A), type(b))
 
     def cumsum(self, x, axis: int):
@@ -464,7 +467,7 @@ class TorchBackend(Backend):
         return a
 
     def shape(self, tensor):
-        if self.is_tensor(tensor, only_native=True):
+        if self.is_tensor(tensor, only_native=True) or isinstance(tensor, SparseCSRMatrix):
             return tensor.shape
         else:
             return NUMPY.shape(tensor)
@@ -472,7 +475,7 @@ class TorchBackend(Backend):
     def staticshape(self, tensor):
         if isinstance(tensor, torch.nn.Module):
             return ()
-        if self.is_tensor(tensor, only_native=True):
+        if self.is_tensor(tensor, only_native=True) or isinstance(tensor, SparseCSRMatrix):
             return tuple([int(s) for s in tensor.shape])
         else:
             return NUMPY.staticshape(tensor)
@@ -628,6 +631,13 @@ class TorchBackend(Backend):
         max_iter = self.as_tensor(max_iter)
         x, residual, iterations, function_evaluations, converged, diverged = torch_sparse_cg_adaptive(lin, y, x0, rtol, atol, max_iter)
         return SolveResult(f"Φ-Flow CG ({'PyTorch*' if self.is_available(y) else 'TorchScript'})", x, residual, iterations, function_evaluations, converged, diverged, "")
+
+    def bi_conjugate_gradient(self, order, lin, y, x0, rtol, atol, max_iter, trj: bool) -> SolveResult or List[SolveResult]:
+        use_cuda = _CUDA_LOADED and False
+        if callable(lin) or trj or not use_cuda:
+            assert self.is_available(y), "Tracing conjugate_gradient with linear operator is not yet supported."
+            return Backend.bi_conjugate_gradient(self, order, lin, y, x0, rtol, atol, max_iter, trj)
+        raise NotImplementedError()  # ToDo call CUDA operator here
 
     def _prepare_graph_inputs(self, args: tuple, wrt: tuple or list):
         args = [self.as_tensor(arg, True) if i in wrt else arg for i, arg in enumerate(args)]
@@ -1024,3 +1034,42 @@ def divide_no_nan(x: torch.Tensor, y: torch.Tensor):
     result = x / torch.where(y == 0, torch.ones_like(y), y)
     result = torch.where(y == 0, torch.zeros_like(result), result)
     return result
+
+
+# --- CUDA Operations ---
+
+
+def load_cuda_ops():
+    path = os.path.abspath(os.path.join(__file__, '../build/phi_torch_cuda.so'))
+    if not os.path.isfile(path):
+        PHI_LOGGER.debug(f"Python CUDA binaries not available at {path}")
+        return False
+    try:
+        torch.ops.load_library(path)
+        PHI_LOGGER.debug(f"Loaded Python CUDA code from {path}")
+        return True
+    except BaseException as err:
+        PHI_LOGGER.warning(f"Failed to load Python CUDA code from {path}.\n{err}")
+        return False
+
+
+_CUDA_LOADED = load_cuda_ops()
+
+
+class SparseCSRMatrix:
+    def __init__(self, values, row_ptr, col_index, shape):
+        self.values = values
+        self.rows = row_ptr
+        self.cols = col_index
+        self.shape = shape
+
+
+if _CUDA_LOADED:  # CUDA-only features
+
+    def csr_matrix(self, column_indices, row_pointers, values, shape: tuple):
+        row_pointers = self.as_tensor(row_pointers)
+        column_indices = self.as_tensor(column_indices)
+        shape = np.asarray(shape)
+        return SparseCSRMatrix(values=values, row_ptr=row_pointers, col_index=column_indices, shape=shape)
+
+    TorchBackend.csr_matrix = csr_matrix

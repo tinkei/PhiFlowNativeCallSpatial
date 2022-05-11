@@ -1455,15 +1455,27 @@ def solve_nonlinear(f: Callable, y, solve: Solve) -> Tensor:
 
 
 def solve_linear(f: Callable[[X], Y],
-                 y: Y, solve: Solve[X, Y],
+                 y: Y,
+                 solve: Solve[X, Y],
                  f_args: tuple or list = (),
                  f_kwargs: dict = None) -> X:
     """
     Solves the system of linear equations *f(x) = y* and returns *x*.
+    This method will use the solver specified in `solve`.
+    The following method identifiers are supported by all backends:
+
+    * `'auto'`: Automatically choose a solver
+    * `'CG'`: Conjugate gradient, only for symmetric and positive definite matrices.
+    * `'CG-adaptive'`: Conjugate gradient with adaptive step size, only for symmetric and positive definite matrices.
+    * `'biCG'`: Biconjugate gradient
+    * `'biCGstab'`: Biconjugate gradient stabilized, first order
+    * `'biCGstab(2)'`: Biconjugate gradient stabilized, second order
+
     For maximum performance, compile `f` using `jit_compile_linear()` beforehand.
     Then, an optimized representation of `f` (such as a sparse matrix) will be used to solve the linear system.
 
-    To obtain additional information about the performed solve, use a `SolveTape`.
+    To obtain additional information about the performed solve, perform the solve within a `SolveTape` context.
+    The used implementation can be obtained as `SolveInfo.method`.
 
     The gradient of this operation will perform another linear solve with the parameters specified by `Solve.gradient_solve`.
 
