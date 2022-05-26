@@ -775,6 +775,9 @@ class Backend:
         """
         raise NotImplementedError(self)
 
+    def sparse_coo_tensor_batched(self, indices: tuple or list, values, shape: tuple):
+        raise NotImplementedError(self)
+
     def csr_matrix(self, column_indices, row_pointers, values, shape: tuple):
         """
         Create a sparse matrix in compressed sparse row (CSR) format.
@@ -795,6 +798,9 @@ class Backend:
         """
         raise NotImplementedError(self)
 
+    def csr_matrix_batched(self, column_indices, row_pointers, values, shape: tuple):
+        raise NotImplementedError(self)
+
     def csc_matrix(self, column_pointers, row_indices, values, shape: tuple):
         """
         Create a sparse matrix in compressed sparse column (CSC) format.
@@ -813,6 +819,9 @@ class Backend:
         Returns:
             Native representation of the sparse matrix
         """
+        raise NotImplementedError(self)
+
+    def csc_matrix_batched(self, column_pointers, row_indices, values, shape: tuple):
         raise NotImplementedError(self)
 
     def coordinates(self, tensor):

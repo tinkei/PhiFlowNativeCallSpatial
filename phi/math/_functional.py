@@ -3,7 +3,7 @@ import types
 import uuid
 import warnings
 from functools import wraps
-from typing import Tuple, Callable, Dict, Generic, List, TypeVar, Any
+from typing import Tuple, Callable, Dict, Generic, List, TypeVar, Any, Set
 
 import numpy as np
 
@@ -265,16 +265,52 @@ class LinearFunction(Generic[X, Y], Callable[[X], Y]):
         tracer = self._get_or_trace(key)
         return tracer.apply(tensors[0])
 
-    def sparse_matrix(self, x, *condition_args, format: str = None, **kwargs):
+    def sparse_matrix(self, x, *condition_args, format: str = None, batched_values: bool = None, **kwargs) -> 'SparseMatrixContainer':
+        """
+        Create an explicit representation of this linear function as a sparse matrix.
+
+        See Also:
+            `sparse_matrix_and_bias()`.
+
+        Args:
+            x: Example function input. This determines the size of the matrix.
+            *condition_args: Additional positional arguments for the linear function.
+            **kwargs: Additional keyword arguments for the linear function.
+            format: Matrix format, one of `coo`, `csr`, `csc`.
+            batched_values: (Optional) Whether to create a sparse matrix batched values to exploit equal sparsity patterns.
+                If `True`, a smaller matrix with batched values will be created.
+                If `False`, values will be flattened into a 1D tensor and columns and rows will be extended accordingly.
+                If not specified, batched matrices will be used if supported by the backend.
+
+        Returns:
+            Sparse matrix representation with `values` property and `native()` method.
+        """
         key = self._condition_key(x, condition_args, kwargs)
         tracer = self._get_or_trace(key)
         assert math.close(tracer.bias, 0), "This is an affine function and cannot be represented by a single matrix. Use sparse_matrix_and_bias() instead."
-        return tracer.get_sparse_matrix(format)
+        return tracer.get_sparse_matrix(matrix_format=format, batched_values=batched_values)
 
-    def sparse_matrix_and_bias(self, x, *condition_args, format: str = None, **kwargs):
+    def sparse_matrix_and_bias(self, x, *condition_args, format: str = None, batched_values: bool = None, **kwargs):
+        """
+        Create an explicit representation of this affine function as a sparse matrix and a bias vector.
+
+        Args:
+            x: Example function input. This determines the size of the matrix.
+            *condition_args: Additional positional arguments for the linear function.
+            **kwargs: Additional keyword arguments for the linear function.
+            format: Matrix format, one of `coo`, `csr`, `csc`.
+            batched_values: (Optional) Whether to create a sparse matrix batched values to exploit equal sparsity patterns.
+                If `True`, a smaller matrix with batched values will be created.
+                If `False`, values will be flattened into a 1D tensor and columns and rows will be extended accordingly.
+                If not specified, batched matrices will be used if supported by the backend.
+
+        Returns:
+            matrix: Sparse matrix representation with `values` property and `native()` method.
+            bias: `Tensor`
+        """
         key = self._condition_key(x, condition_args, kwargs)
         tracer = self._get_or_trace(key)
-        return tracer.get_sparse_matrix(format), tracer.bias
+        return tracer.get_sparse_matrix(matrix_format=format, batched_values=batched_values), tracer.bias
 
     def _condition_key(self, x, condition_args, kwargs):
         kwargs['n_condition_args'] = len(condition_args)
@@ -743,7 +779,6 @@ class ShiftLinTracer(Tensor):
         self.val: Dict[Shape, Tensor] = simplify_add(values_by_shift)
         self.bias = bias
         self._shape = shape
-        self._sparse_coo = self._sparse_csr = self._sparse_csc = None
 
     def native(self, order: str or tuple or list or Shape = None):
         """
@@ -767,7 +802,7 @@ class ShiftLinTracer(Tensor):
     def apply(self, value: Tensor) -> NativeTensor:
         assert value.shape == self.source.shape
         mat = self.get_sparse_matrix().native()
-        independent_dims = self.independent_dims
+        independent_dims = self.source.shape.without(self.dependent_dims)
         # TODO slice for missing dimensions
         order_src = concat_shapes(value.shape.only(independent_dims), value.shape.without(independent_dims))
         order_out = concat_shapes(self._shape.only(independent_dims), self._shape.without(independent_dims))
@@ -778,17 +813,17 @@ class ShiftLinTracer(Tensor):
         native_out = backend.reshape(native_out, order_out.sizes)
         return NativeTensor(native_out, order_out)
 
-    def get_sparse_coordinate_matrix(self) -> 'SparseMatrixContainer':
+    def get_sparse_coordinate_matrix(self, batched_values: bool, sort_indices=False) -> 'SparseMatrixContainer':
         """
         Builds a sparse matrix that represents this linear operation.
         Independent dimensions, those that can be treated as batch dimensions, are recognized automatically and ignored.
         """
-        if self._sparse_coo is not None:
-            return self._sparse_coo
-        independent_dims = self.independent_dims
+        independent_dims = self.source.shape.without(self.pattern_dims if batched_values else self.dependent_dims)  # these will be parallelized and not added to the matrix
         out_shape = self._shape.without(independent_dims)
         src_shape = self.source.shape.without(independent_dims)
+        val_batch_shape = merge_shapes(*self.val.values()).without(out_shape)
         cols = []
+        rows = np.arange(out_shape.volume * len(self.val)) // len(self.val)
         vals = []
         for shift, values in self.val.items():
             cells = list(cell_indices(out_shape))
@@ -797,26 +832,26 @@ class ShiftLinTracer(Tensor):
             cells = [(cell + shift.get_size(dim) if dim in shift else cell) % src_shape.get_size(dim) for dim, cell in zip(src_shape.names, cells)]  # shift & wrap
             src_indices = cell_number(cells, src_shape)
             cols.append(src_indices)
-            vals.append(reshaped_native(values, [*out_shape]))
+            vals.append(reshaped_native(values, [val_batch_shape, *out_shape], force_expand=True))
         cols = np.stack(cols, -1).flatten()
         backend = choose_backend(*vals)
-        vals = backend.flatten(backend.stack(vals, -1))
-        rows = np.arange(out_shape.volume * len(self.val)) // len(self.val)
-        # TODO sort indices?
-        self._sparse_coo = SparseMatrixContainer('coo', (out_shape.volume, src_shape.volume),
-                                                 set(self.val.keys()), self.dependent_dims,
-                                                 NativeTensor(vals, instance(nnz=len(vals))), rows, cols)
-        return self._sparse_coo
+        vals = backend.stack(vals, -1)
+        if batched_values:
+            values = backend.reshape(vals, (val_batch_shape.volume, -1))
+            values = wrap(values, batch('_batch'), instance('nnz'))
+        else:
+            values = wrap(backend.flatten(vals), instance('nnz'))
+        if sort_indices:
+            raise NotImplementedError("Index sorting not yet supported.")
+        return SparseMatrixContainer('coo', src_shape, out_shape, set(self.val.keys()), values, rows, cols)
 
-    def get_sparse_csr_matrix(self) -> 'SparseMatrixContainer':
+    def get_sparse_csr_matrix(self, batched_values: bool) -> 'SparseMatrixContainer':
         """
         Builds a sparse matrix that represents this linear operation.
         Independent dimensions, those that can be treated as batch dimensions, are recognized automatically and ignored.
         """
-        if self._sparse_csr is not None:
-            return self._sparse_csr
-        coo = self.get_sparse_coordinate_matrix()
-        idx = np.arange(1, len(coo.values)+1)  # start indexing at 1 since 0 might get removed
+        coo = self.get_sparse_coordinate_matrix(batched_values=batched_values)
+        idx = np.arange(1, coo.values.nnz.size + 1)  # start indexing at 1 since 0 might get removed
         import scipy.sparse
         scipy_csr = scipy.sparse.csr_matrix((idx, (coo.rows, coo.cols)), shape=coo.shape)
         col_indices = scipy_csr.indices
@@ -825,17 +860,14 @@ class ShiftLinTracer(Tensor):
             warnings.warn("Failed to create CSR matrix because the CSR matrix contains fewer non-zero values than COO. This can happen when the `x` tensor is too small for the stencil.", RuntimeWarning)
             return coo
         values = coo.values.nnz[wrap(scipy_csr.data - 1, instance('nnz'))]  # Change order accordingly
-        self._sparse_csr = SparseMatrixContainer('csr', coo.shape, coo.indices_key, coo.src_shape, values, row_ptr, col_indices)
-        return self._sparse_csr
+        return SparseMatrixContainer('csr', coo.src_shape, coo.out_shape, coo.sparsity_key, values, row_ptr, col_indices)
 
-    def get_sparse_csc_matrix(self) -> 'SparseMatrixContainer':
+    def get_sparse_csc_matrix(self, batched_values: bool) -> 'SparseMatrixContainer':
         """
         Builds a sparse matrix that represents this linear operation.
         Independent dimensions, those that can be treated as batch dimensions, are recognized automatically and ignored.
         """
-        if self._sparse_csc is not None:
-            return self._sparse_csc
-        coo = self.get_sparse_coordinate_matrix()
+        coo = self.get_sparse_coordinate_matrix(batched_values=batched_values)
         idx = np.arange(1, len(coo.values)+1)  # start indexing at 1 since 0 might get removed
         import scipy.sparse
         scipy_csr = scipy.sparse.csc_matrix((idx, (coo.rows, coo.cols)), shape=coo.shape)
@@ -845,10 +877,9 @@ class ShiftLinTracer(Tensor):
             warnings.warn("Failed to create CSR matrix because the CSR matrix contains fewer non-zero values than COO. This can happen when the `x` tensor is too small for the stencil.", RuntimeWarning)
             return coo
         values = coo.values.nnz[wrap(scipy_csr.data - 1, instance('nnz'))]  # Change order accordingly
-        self._sparse_csc = SparseMatrixContainer('csc', coo.shape, coo.indices_key, coo.src_shape, values, row_indices, col_ptr)
-        return self._sparse_csc
+        return SparseMatrixContainer('csc', coo.src_shape, coo.out_shape, coo.sparsity_key, values, row_indices, col_ptr)
 
-    def get_sparse_matrix(self, matrix_format: str = None) -> 'SparseMatrixContainer':
+    def get_sparse_matrix(self, matrix_format: str = None, batched_values: bool = None) -> 'SparseMatrixContainer':
         if matrix_format is None:
             if self.default_backend.supports(Backend.csc_matrix):
                 matrix_format = 'csc'
@@ -856,22 +887,38 @@ class ShiftLinTracer(Tensor):
                 matrix_format = 'csr'
             else:
                 matrix_format = 'coo'
+        if batched_values is None:
+            if matrix_format == 'csc':
+                batched_values = self.default_backend.supports(Backend.csc_matrix_batched)
+            elif matrix_format == 'csr':
+                batched_values = self.default_backend.supports(Backend.csr_matrix_batched)
+            elif matrix_format == 'coo':
+                batched_values = self.default_backend.supports(Backend.sparse_coo_tensor_batched)
         if matrix_format == 'csc':
-            return self.get_sparse_csc_matrix()
+            return self.get_sparse_csc_matrix(batched_values=batched_values)
         if matrix_format == 'csr':
-            return self.get_sparse_csr_matrix()
+            return self.get_sparse_csr_matrix(batched_values=batched_values)
         elif matrix_format == 'coo':
-            return self.get_sparse_coordinate_matrix()
+            return self.get_sparse_coordinate_matrix(batched_values=batched_values)
         else:
             raise NotImplementedError(f"Unsupported sparse matrix format: '{matrix_format}'")
 
     @property
     def dependent_dims(self):
+        """
+        Dimensions relevant to the linear operation.
+        This includes `pattern_dims` as well as dimensions along which only the values vary.
+        These dimensions cannot be parallelized trivially with a non-batched matrix.
+        """
         return merge_shapes(*[t.shape for t in self.val.values()])
 
     @property
-    def independent_dims(self):
-        return self.source.shape.without(self.dependent_dims)
+    def pattern_dims(self) -> Set[str]:
+        """
+        Dimensions along which the sparse matrix contains off-diagonal elements.
+        These dimensions must be part of the sparse matrix and cannot be parallelized.
+        """
+        return set(sum([offset.names for offset in self.val], ()))
 
     @property
     def dtype(self):
@@ -1024,35 +1071,37 @@ class SparseMatrixContainer:
 
     def __init__(self,
                  indexing_type: str,
-                 shape: tuple,
-                 indices_key,
                  src_shape: Shape,
+                 out_shape: Shape,
+                 sparsity_key,
                  values: Tensor,
-                 rows, cols,
-                 ):
+                 rows,
+                 cols):
         """
-
         Args:
-            shape: Sparse matrix shape
-            indices_key: Low-dimensional representation of the sparsity pattern, typically a set of offsets.
-            rows: Row indices
-            cols: Column indices
-            values: Values
+            src_shape: `Shape` of the input excluding batch-like dimensions.
+            out_shape: `Shape` of the output excluding batch-like dimensions.
+            sparsity_key: Low-dimensional representation of the sparsity pattern, typically a set of offsets.
+                The key must be comparable using `==`.
+            rows: Row indices, native 1D tensor
+            cols: Column indices, native 1D tensor
+            values: Values `Tensor`, must include `nnz` instance dimension but may contain additional dimensions that behave like batch dimensions independent of actual type.
             src_shape: Non-flattened `Shape` of `x` vectors compatible with this matrix.
         """
         assert indexing_type in ('coo', 'csr', 'csc')
         self.indexing_type = indexing_type
-        self.shape = shape
-        self.indices_key = indices_key
+        self.src_shape = src_shape
+        self.out_shape = out_shape
+        self.sparsity_key = sparsity_key
         self.rows = rows
         self.cols = cols
         self.values = values
-        self.src_shape = src_shape
+        assert values.shape[-1].name == 'nnz'
 
     def __eq__(self, other):
         return isinstance(other, SparseMatrixContainer) and \
                self.indexing_type == other.indexing_type and \
-               self.indices_key == other.indices_key and \
+               self.sparsity_key == other.sparsity_key and \
                self.src_shape == other.src_shape
 
     def __variable_attrs__(self):
@@ -1061,12 +1110,28 @@ class SparseMatrixContainer:
     def native(self):
         backend = choose_backend(self.rows, self.cols, *self.values._natives())
         if self.indexing_type == 'csc':
-            return backend.csc_matrix(self.cols, self.rows, self.values.native(), self.shape)
+            if self.values.rank == 1:
+                return backend.csc_matrix(self.cols, self.rows, self.values.native(), self.shape)
+            else:
+                return backend.csc_matrix_batched(self.cols, self.rows, self.values.native(self.values.shape), self.shape)
         if self.indexing_type == 'csr':
-            return backend.csr_matrix(self.cols, self.rows, self.values.native(), self.shape)
+            if self.values.rank == 1:
+                return backend.csr_matrix(self.cols, self.rows, self.values.native(), self.shape)
+            else:
+                return backend.csr_matrix_batched(self.cols, self.rows, self.values.native(self.values.shape), self.shape)
         if self.indexing_type == 'coo':
-            return backend.sparse_coo_tensor((self.rows, self.cols), self.values.native(), self.shape)
+            if self.values.rank == 1:
+                return backend.sparse_coo_tensor((self.rows, self.cols), self.values.native(), self.shape)
+            else:
+                return backend.sparse_coo_tensor_batched((self.rows, self.cols), self.values.native(self.values.shape), self.shape)
         assert False, self.indexing_type
+
+    @property
+    def shape(self):
+        return self.out_shape.volume, self.src_shape.volume
+
+    def __repr__(self):
+        return f"SparseMatrix[{self.indexing_type} shape={self.shape} values={self.values.shape}]"
 
 
 class Solve(Generic[X, Y]):  # TODO move to phi.math._functional, put Tensors there
@@ -1529,9 +1594,9 @@ def _linear_solve_forward(y, solve: Solve, native_lin_op,
         y = solve.preprocess_y(y, *solve.preprocess_y_args)
     y_nest, (y_tensor,) = disassemble_tree(y)
     x0_nest, (x0_tensor,) = disassemble_tree(solve.x0)
-    batch_dims = (y_tensor.shape & x0_tensor.shape).without(active_dims)
+    batch_dims = merge_shapes(y_tensor.shape.without(active_dims), x0_tensor.shape.without(active_dims))
     x0_native = backend.as_tensor(reshaped_native(x0_tensor, [batch_dims, active_dims], force_expand=True))
-    y_native = backend.as_tensor(reshaped_native(y_tensor, [batch_dims, active_dims], force_expand=True))
+    y_native = backend.as_tensor(reshaped_native(y_tensor, [batch_dims, y_tensor.shape.only(active_dims)], force_expand=True))
     rtol = backend.as_tensor(reshaped_native(math.to_float(solve.relative_tolerance), [batch_dims], force_expand=True))
     atol = backend.as_tensor(reshaped_native(solve.absolute_tolerance, [batch_dims], force_expand=True))
     maxi = backend.as_tensor(reshaped_native(solve.max_iterations, [batch_dims], force_expand=True))
@@ -1589,9 +1654,8 @@ def attach_gradient_solve(forward_solve: Callable):
 def _matrix_solve_forward(y, solve: Solve, matrix: SparseMatrixContainer,
                           backend: Backend = None, is_backprop=False):  # kwargs
     matrix_native = matrix.native()
-    active_dims = matrix.src_shape
-    result = _linear_solve_forward(y, solve, matrix_native, active_dims=active_dims, backend=backend, is_backprop=is_backprop)
-    return result  # must return exactly `x` so gradient isn't computed w.r.t. other quantities
+    result = _linear_solve_forward(y, solve, matrix_native, active_dims=matrix.src_shape, backend=backend, is_backprop=is_backprop)
+    return result  # must return only `x` so gradient isn't computed w.r.t. other quantities
 
 
 _matrix_solve = attach_gradient_solve(_matrix_solve_forward)
