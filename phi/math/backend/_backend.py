@@ -1052,7 +1052,7 @@ class Backend:
         dx = residual = y - self.linear(lin, x)
         iterations = self.zeros([batch_size], DType(int, 32))
         function_evaluations = self.ones([batch_size], DType(int, 32))
-        residual_squared = rsq0 = self.sum(residual ** 2, -1, keepdims=True)
+        residual_squared = self.sum(residual ** 2, -1, keepdims=True)
         diverged = self.any(~self.isfinite(x), axis=(1,))
         converged = self.all(residual_squared <= tolerance_sq, axis=(1,))
         trajectory = [SolveResult(method, x, residual, iterations, function_evaluations, converged, diverged, "")] if trj else None
@@ -1067,14 +1067,11 @@ class Backend:
             step_size = self.divide_no_nan(residual_squared, dx_dy)
             step_size *= self.expand_dims(self.to_float(continue_1), -1)  # this is not really necessary but ensures batch-independence
             x += step_size * dx
-            # if it_counter % 50 == 0:
-            #     residual = y - self.linear(lin, x); function_evaluations += 1
-            # else:
             residual = residual - step_size * dy  # in-place subtraction affects convergence
             residual_squared_old = residual_squared
             residual_squared = self.sum(residual ** 2, -1, keepdims=True)
             dx = residual + self.divide_no_nan(residual_squared, residual_squared_old) * dx
-            diverged = self.any(residual_squared / rsq0 > 100, axis=(1,)) & (iterations >= 8)
+            diverged = self.any(~self.isfinite(residual), axis=-1)
             converged = self.all(residual_squared <= tolerance_sq, axis=(1,))
             if trajectory is not None:
                 trajectory.append(SolveResult(method, x, residual, iterations, function_evaluations, converged, diverged, ""))
@@ -1100,7 +1097,7 @@ class Backend:
         dy = self.linear(lin, dx)
         iterations = self.zeros([batch_size], DType(int, 32))
         function_evaluations = self.ones([batch_size], DType(int, 32))
-        residual_squared = rsq0 = self.sum(residual ** 2, -1, keepdims=True)
+        residual_squared = self.sum(residual ** 2, -1, keepdims=True)
         diverged = self.any(~self.isfinite(x), axis=(1,))
         converged = self.all(residual_squared <= tolerance_sq, axis=(1,))
         trajectory = [SolveResult(method, x, residual, iterations, function_evaluations, converged, diverged, "")] if trj else None
@@ -1114,15 +1111,12 @@ class Backend:
             step_size = self.divide_no_nan(self.sum(dx * residual, axis=-1, keepdims=True), dx_dy)
             step_size *= self.expand_dims(self.to_float(continue_1), -1)  # this is not really necessary but ensures batch-independence
             x += step_size * dx
-            # if it_counter % 50 == 0:  # Not traceable since Python bool
-            #     residual = y - self.linear(lin, x); function_evaluations += 1
-            # else:
             residual = residual - step_size * dy  # in-place subtraction affects convergence
             residual_squared = self.sum(residual ** 2, -1, keepdims=True)
             dx = residual - self.divide_no_nan(self.sum(residual * dy, axis=-1, keepdims=True) * dx, dx_dy)
             with spatial_derivative_evaluation(1):
                 dy = self.linear(lin, dx); function_evaluations += continue_1
-            diverged = self.any(residual_squared / rsq0 > 100, axis=(1,)) & (iterations >= 8)
+            diverged = self.any(~self.isfinite(residual), axis=-1)
             converged = self.all(residual_squared <= tolerance_sq, axis=(1,))
             if trajectory is not None:
                 trajectory.append(SolveResult(method, x, residual, iterations, function_evaluations, converged, diverged, ""))
