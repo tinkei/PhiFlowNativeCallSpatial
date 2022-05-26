@@ -2,7 +2,6 @@ import warnings
 from typing import Tuple, Callable, List, Union, Any
 
 from phi import math
-from phi.math.backend import PHI_LOGGER
 
 BATCH_DIM = 'batch'
 SPATIAL_DIM = 'spatial'
@@ -88,7 +87,7 @@ class Shape:
     def __iter__(self):
         return iter(self[i] for i in range(self.rank))
 
-    def index(self, dim: str or 'Shape' or None) -> int:
+    def index(self, dim: str or 'Shape') -> int:
         """
         Finds the index of the dimension within this `Shape`.
 
@@ -101,9 +100,7 @@ class Shape:
         Returns:
             Index as `int`.
         """
-        if dim is None:
-            return None
-        elif isinstance(dim, str):
+        if isinstance(dim, str):
             return self.names.index(dim)
         elif isinstance(dim, Shape):
             assert dim.rank == 1, f"index() requires a single dimension as input but got {dim}. Use indices() for multiple dimensions."
@@ -427,7 +424,7 @@ class Shape:
         return self.sizes[0]
 
     @property
-    def type(self) -> int:
+    def type(self) -> str:
         """
         Only for Shapes containing exactly one single dimension.
         Returns the type of the dimension.
@@ -561,7 +558,7 @@ class Shape:
             dims = dims(self)
         if isinstance(dims, str):
             dims = parse_dim_order(dims)
-        if isinstance(dims, (tuple, list)):
+        if isinstance(dims, (tuple, list, set)):
             return self[[i for i in range(self.rank) if self.names[i] not in dims]]
         elif isinstance(dims, Shape):
             return self[[i for i in range(self.rank) if self.names[i] not in dims.names]]
@@ -588,7 +585,7 @@ class Shape:
             dims = dims(self)
         if isinstance(dims, str):
             dims = parse_dim_order(dims)
-        if isinstance(dims, (tuple, list)):
+        if isinstance(dims, (tuple, list, set)):
             return self[[i for i in range(self.rank) if self.names[i] in dims]]
         elif isinstance(dims, Shape):
             return self[[i for i in range(self.rank) if self.names[i] in dims.names]]
@@ -749,7 +746,7 @@ class Shape:
         Returns:
             `Shape` with all sizes undefined (`None`)
         """
-        return Shape((None,) * self.rank, self.names, self.types, self.item_names)
+        return Shape((None,) * self.rank, self.names, self.types, (None,) * self.rank)
 
     def _replace_single_size(self, dim: str, size: int):
         new_sizes = list(self.sizes)
@@ -956,7 +953,7 @@ class Shape:
 EMPTY_SHAPE = Shape((), (), (), ())
 """ Empty shape, `()` """
 
-DimFilter = Union[str, tuple, list, Shape, Callable]
+DimFilter = Union[str, tuple, list, set, Shape, Callable]
 try:
     DimFilter.__doc__ = """Dimension filters can be used with `Shape.only()` and `Shype.without()`, making them the standard tool for specifying sets of dimensions.
     
@@ -1261,7 +1258,7 @@ def instance(*args, **dims: int or str or tuple or list or Shape) -> Shape:
         raise AssertionError(f"instance() must be called either as a selector instance(Shape) or instance(Tensor) or as a constructor instance(*names, **dims). Got *args={args}, **dims={dims}")
 
 
-def merge_shapes(*shapes: Shape or Any, order=(batch, instance, spatial, channel)):
+def merge_shapes(*shapes: Shape or Any, order: Tuple[Callable[[Shape], Shape], ...] = (batch, instance, spatial, channel)):
     """
     Combines `shapes` into a single `Shape`, grouping dimensions by type.
     If dimensions with equal names are present in multiple shapes, their types and sizes must match.
@@ -1283,23 +1280,25 @@ def merge_shapes(*shapes: Shape or Any, order=(batch, instance, spatial, channel
     shapes = [obj if isinstance(obj, Shape) else shape(obj) for obj in shapes]
     merged = []
     for dim_type in order:
-        type_group = dim_type(shapes[0])
+        group_result = dim_type(shapes[0])
         for sh in shapes[1:]:
-            sh = dim_type(sh)
-            for dim in sh:
-                if dim not in type_group:
-                    type_group = type_group._expand(dim, pos=-1)
+            for dim in dim_type(sh):
+                if dim not in group_result:
+                    group_result = group_result._expand(dim, pos=-1)
                 else:  # check size match
-                    if not _size_equal(dim.size, type_group.get_size(dim.name)):
-                        raise IncompatibleShapes(f"Cannot merge shapes {shapes} because dimension '{dim.name}' exists with different sizes.", *shapes)
-                    names1 = type_group.get_item_names(dim)
-                    names2 = sh.get_item_names(dim)
+                    if not _size_equal(dim.size, group_result.get_size(dim)):
+                        if dim.size is not None:
+                            raise IncompatibleShapes(f"Cannot merge shapes {shapes} because dimension '{dim.name}' exists with different sizes.", *shapes)
+                        elif group_result.get_size(dim) is None:
+                            group_result = group_result.with_dim_size(dim, dim.size)._with_item_name(dim, dim.item_names[0])
+                    names1 = group_result.get_item_names(dim)
+                    names2 = dim.item_names[0]
                     if names1 is not None and names2 is not None and len(names1) > 1:
                         if names1 != names2:
                             raise IncompatibleShapes(f"Cannot merge shapes {shapes} because dimension '{dim.name}' exists with different item names.", *shapes)
                     elif names1 is None and names2 is not None:
-                        type_group = type_group._with_item_name(dim, tuple(names2))
-        merged.append(type_group)
+                        group_result = group_result._with_item_name(dim, tuple(names2))
+        merged.append(group_result)
     return concat_shapes(*merged)
 
 

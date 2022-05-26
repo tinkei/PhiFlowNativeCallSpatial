@@ -170,7 +170,7 @@ def reshaped_native(value: Tensor,
 
     Args:
         value: `Tensor`
-        groups: Sequence of dimension names as `str` or groups of dimensions to be packed_dim as `Shape`.
+        groups: Sequence of dimension names as `str` or groups of dimensions to be packed as `Shape`.
         force_expand: `bool` or sequence of dimensions.
             If `True`, repeats the tensor along missing dimensions.
             If `False`, puts singleton dimensions where possible.

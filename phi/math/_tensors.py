@@ -84,16 +84,32 @@ class Tensor:
 
     @property
     def dtype(self) -> DType:
-        """ Data type of the elements of this `Tensor`. """
+        """
+        Data type of the elements of this `Tensor`.
+
+        Returns:
+            `DType`
+        """
         raise NotImplementedError()
 
     @property
     def shape(self) -> Shape:
-        """ The `Shape` lists the dimensions with their sizes, names and types. """
+        """
+        The `Shape` lists the dimensions with their sizes, names, types and optionally item names.
+
+        Returns:
+            `Shape`
+        """
         raise NotImplementedError()
 
     @property
-    def default_backend(self):
+    def default_backend(self) -> Backend:
+        """
+        The backend that will be used for operations involving only this `Tensor` if no backend is specified explicitly.
+
+        Returns:
+            `Backend`
+        """
         from ._ops import choose_backend_t
         return choose_backend_t(self)
 
