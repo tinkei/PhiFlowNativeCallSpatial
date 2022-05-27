@@ -3,7 +3,7 @@ from unittest import TestCase
 import phi
 from phi import math, field
 from phi.field import CenteredGrid
-from phi.math import Solve, Diverged, wrap, tensor, SolveTape, extrapolation, spatial, batch, channel, NotConverged
+from phi.math import Solve, Diverged, wrap, tensor, SolveTape, extrapolation, spatial, batch, channel, NotConverged, NAN
 from phi.math.backend import Backend
 
 BACKENDS = phi.detect_backends()
@@ -238,6 +238,10 @@ class TestFunctional(TestCase):
                 field.solve_linear(math.jit_compile_linear(math.laplace), y, solve)
                 assert False
             except (Diverged, NotConverged):
+                pass
+            try:
+                field.solve_linear(math.jit_compile_linear(math.laplace), y + NAN, solve)
+            except Diverged:
                 pass
             with math.SolveTape(record_trajectories=True) as solves:
                 try:
