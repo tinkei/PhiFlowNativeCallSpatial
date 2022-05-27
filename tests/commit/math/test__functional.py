@@ -3,7 +3,7 @@ from unittest import TestCase
 import phi
 from phi import math, field
 from phi.field import CenteredGrid
-from phi.math import Solve, Diverged, wrap, tensor, SolveTape, extrapolation, spatial, batch, channel
+from phi.math import Solve, Diverged, wrap, tensor, SolveTape, extrapolation, spatial, batch, channel, NotConverged
 from phi.math.backend import Backend
 
 BACKENDS = phi.detect_backends()
@@ -229,7 +229,7 @@ class TestFunctional(TestCase):
             assert solves[0] == solves[solve]
             math.assert_close(solves[solve].residual.values, 0, abs_tolerance=1e-3)
 
-    def test_solve_diverge(self):
+    def test_impossible_solves(self):
         y = math.ones(spatial(x=2)) * (1, 2)
         x0 = math.zeros(spatial(x=2))
         for method in ['CG']:
@@ -237,13 +237,13 @@ class TestFunctional(TestCase):
             try:
                 field.solve_linear(math.jit_compile_linear(math.laplace), y, solve)
                 assert False
-            except Diverged:
+            except (Diverged, NotConverged):
                 pass
             with math.SolveTape(record_trajectories=True) as solves:
                 try:
                     field.solve_linear(math.jit_compile_linear(math.laplace), y, solve)  # impossible
                     assert False
-                except Diverged:
+                except (Diverged, NotConverged):
                     pass
 
     def test_solve_linear_matrix_dirichlet(self):
